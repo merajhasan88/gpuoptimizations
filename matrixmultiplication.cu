@@ -5,47 +5,48 @@ __global__ void matrix_multiplication_kernel(const float* A, const float* B, flo
 {
  __shared__ float ds_A[TILE_DIM][TILE_DIM];
     __shared__ float ds_B[TILE_DIM][TILE_DIM];
- int bx = blockIdx.x;  int by = blockIdx.y;
+
+    int bx = blockIdx.x;  int by = blockIdx.y;
     int tx = threadIdx.x; int ty = threadIdx.y;
 
-    // Output target tracking coordinates
+    // LeetGPU Mapping: row tracks M (Rows of A & C), col tracks K (Columns of B & C)
     int row = by * TILE_DIM + ty;
     int col = bx * TILE_DIM + tx;
     float sum = 0.0f;
-// 2. Loop through all needed tiles to span the inner K dimension
-    for (int phase = 0; phase < (K + TILE_DIM - 1) / TILE_DIM; ++phase) {
 
-        // --- LOAD MATRIX A INTO SHARED TILES ---
-        // Crucial Check: Ensure row is inside M AND global column index is inside K
-        if (row < M && (phase * TILE_DIM + tx) < K) {
-            ds_A[ty][tx] = A[row * K + phase * TILE_DIM + tx];
+    // LeetGPU Mapping: The inner shared dimension loop is bounded by N
+    for (int phase = 0; phase < (N + TILE_DIM - 1) / TILE_DIM; ++phase) {
+
+        // --- LOAD MATRIX A (M x N) ---
+        // Stride is N. Row must be < M, Col index must be < N.
+        if (row < M && (phase * TILE_DIM + tx) < N) {
+            ds_A[ty][tx] = A[row * N + phase * TILE_DIM + tx];
         } else {
-            ds_A[ty][tx] = 0.0f; // Safe padding to prevent trash values in dot product
+            ds_A[ty][tx] = 0.0f;
         }
 
-        // --- LOAD MATRIX B INTO SHARED TILES ---
-        // Crucial Check: Ensure global row index is inside K AND col is inside N
-        if ((phase * TILE_DIM + ty) < K && col < N) {
-            ds_B[ty][tx] = B[(phase * TILE_DIM + ty) * N + col];
+        // --- LOAD MATRIX B (N x K) ---
+        // Stride is K. Row index must be < N, Col must be < K.
+        if ((phase * TILE_DIM + ty) < N && col < K) {
+            ds_B[ty][tx] = B[(phase * TILE_DIM + ty) * K + col];
         } else {
-            ds_B[ty][tx] = 0.0f; // Safe padding
+            ds_B[ty][tx] = 0.0f;
         }
 
-        // 3. Sync to guarantee tiles are fully populated before math begins
         __syncthreads();
 
-        // 4. Dot product multiplication on local shared memory
+        // Dot product over the loaded tiles
         for (int i = 0; i < TILE_DIM; ++i) {
             sum += ds_A[ty][i] * ds_B[i][tx];
         }
 
-        // 5. Sync to ensure math finishes before loading the next phase's tile data
         __syncthreads();
     }
 
-    // 6. Final Target Write Boundary Check
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
+    // --- WRITE TO DESTINATION MATRIX C (M x K) ---
+    // Stride is K.
+    if (row < M && col < K) {
+        C[row * K + col] = sum;
     }
 }
 
@@ -54,8 +55,8 @@ extern "C" void solve(const float* A, const float* B, float* C, int M, int N, in
     dim3 threadsPerBlock(16, 16);
      dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
                         (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
-// dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,
-//                        (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
+ //dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,
+  //                      (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
     matrix_multiplication_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
     cudaDeviceSynchronize();
