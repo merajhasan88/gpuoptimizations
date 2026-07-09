@@ -1,5 +1,5 @@
 #include <cuda_runtime.h>
-#define TILE_DIM 16
+#define TILE_DIM 32
 __global__ void matrix_multiplication_kernel(const float* A, const float* B, float* C, int M, int N,
                                              int K) 
 {
@@ -52,7 +52,7 @@ __global__ void matrix_multiplication_kernel(const float* A, const float* B, flo
 
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
 extern "C" void solve(const float* A, const float* B, float* C, int M, int N, int K) {
-    dim3 threadsPerBlock(16, 16);
+    dim3 threadsPerBlock(32, 32);
      dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
                         (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
  //dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,
