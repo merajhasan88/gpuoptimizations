@@ -1,6 +1,502 @@
 #include <cuda_runtime.h>
 #include <stddef.h>
 
+// A block contains 32 threads horizontally and 8 vertically.
+//
+// Total threads:
+// 32 * 8 = 256 threads.
+#define THREADS_X 32
+#define THREADS_Y 8
+
+// Each block calculates a 64 x 64 tile of C.
+#define TILE_M 64
+#define TILE_N 16
+#define TILE_K 64
+
+// Each thread calculates:
+//
+// 8 output rows
+// 2 output columns
+//
+// Therefore:
+//
+// 8 thread rows * 8 output rows/thread = 64 output rows
+// 32 thread columns * 2 output columns/thread = 64 output columns
+#define MICRO_M 8
+#define MICRO_K 2
+
+
+__global__ void matrix_multiplication_kernel_8x2(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K)
+{
+    /*
+     * Shared A tile:
+     *
+     *     64 rows x 16 reduction values.
+     *
+     * The extra column changes the shared-memory row stride from
+     * 16 floats to 17 floats.
+     *
+     * This padding can reduce shared-memory bank conflicts.
+     */
+    __shared__ float shared_A[TILE_M][TILE_N + 1];
+
+    /*
+     * Shared B tile:
+     *
+     *     16 reduction values x 64 output columns.
+     *
+     * The extra column changes the row stride from 64 floats to 65.
+     */
+    __shared__ float shared_B[TILE_N][TILE_K + 1];
+
+    // Thread's horizontal position: 0 through 31.
+    const int tx = threadIdx.x;
+
+    // Thread's vertical position: 0 through 7.
+    const int ty = threadIdx.y;
+
+    /*
+     * Starting global output row and column for this block.
+     *
+     * Every block computes a 64 x 64 section of matrix C.
+     */
+    const int block_row = blockIdx.y * TILE_M;
+    const int block_col = blockIdx.x * TILE_K;
+
+    /*
+     * Starting row and column for this thread inside the block tile.
+     *
+     * Each thread computes eight rows and two columns.
+     */
+    const int local_row = ty * MICRO_M;
+    const int local_col = tx * MICRO_K;
+
+    // Starting global output row for this thread.
+    const int global_row = block_row + local_row;
+
+    // Starting global output column for this thread.
+    const int global_col = block_col + local_col;
+
+    /*
+     * Sixteen accumulators:
+     *
+     * 8 rows x 2 columns = 16 output values per thread.
+     *
+     * Keeping the same number of accumulators as the 4 x 4 kernel
+     * preserves similar arithmetic reuse.
+     */
+    float acc00 = 0.0f;
+    float acc01 = 0.0f;
+
+    float acc10 = 0.0f;
+    float acc11 = 0.0f;
+
+    float acc20 = 0.0f;
+    float acc21 = 0.0f;
+
+    float acc30 = 0.0f;
+    float acc31 = 0.0f;
+
+    float acc40 = 0.0f;
+    float acc41 = 0.0f;
+
+    float acc50 = 0.0f;
+    float acc51 = 0.0f;
+
+    float acc60 = 0.0f;
+    float acc61 = 0.0f;
+
+    float acc70 = 0.0f;
+    float acc71 = 0.0f;
+
+    /*
+     * Divide the N dimension into chunks of 16.
+     */
+    const int number_of_phases =
+        (N + TILE_N - 1) / TILE_N;
+
+    for (int phase = 0; phase < number_of_phases; ++phase)
+    {
+        /*
+         * ---------------------------------------------------------
+         * Load matrix A into shared memory
+         * ---------------------------------------------------------
+         *
+         * shared_A contains:
+         *
+         *     64 x 16 = 1024 useful values.
+         *
+         * There are 256 threads.
+         *
+         * Therefore, each thread must load:
+         *
+         *     1024 / 256 = 4 A values.
+         *
+         * Although each thread computes eight output rows, loading all
+         * eight A values per thread would duplicate work.
+         *
+         * We instead use the linear thread ID to distribute the 1024
+         * shared-memory elements evenly across the entire block.
+         */
+
+        // Convert the two-dimensional thread coordinate into 0 through 255.
+        const int linear_tid = ty * THREADS_X + tx;
+
+        /*
+         * Each thread loads four elements from the 64 x 16 A tile.
+         */
+        #pragma unroll
+        for (int load = 0; load < 4; ++load)
+        {
+            /*
+             * Linear shared-memory element assigned to this thread.
+             *
+             * Values range from 0 through 1023.
+             */
+            const int linear_index =
+                linear_tid + load * 256;
+
+            /*
+             * Convert the linear index into:
+             *
+             *     shared-memory row:    0 through 63
+             *     shared-memory column: 0 through 15
+             */
+            const int shared_row =
+                linear_index / TILE_N;
+
+            const int shared_col =
+                linear_index % TILE_N;
+
+            // Corresponding global row in matrix A.
+            const int a_row =
+                block_row + shared_row;
+
+            // Corresponding global column in matrix A.
+            const int a_col =
+                phase * TILE_N + shared_col;
+
+            /*
+             * Load the A value when it is inside matrix bounds.
+             *
+             * Otherwise write zero for boundary padding.
+             */
+            shared_A[shared_row][shared_col] =
+                (a_row < M && a_col < N)
+                    ? A[(size_t)a_row * N + a_col]
+                    : 0.0f;
+        }
+
+        /*
+         * ---------------------------------------------------------
+         * Load matrix B into shared memory
+         * ---------------------------------------------------------
+         *
+         * shared_B contains:
+         *
+         *     16 x 64 = 1024 useful values.
+         *
+         * Each of the 256 threads again loads four values.
+         */
+        #pragma unroll
+        for (int load = 0; load < 4; ++load)
+        {
+            /*
+             * Linear position in the 16 x 64 B tile.
+             */
+            const int linear_index =
+                linear_tid + load * 256;
+
+            /*
+             * Convert the linear position into:
+             *
+             *     shared-memory row:    0 through 15
+             *     shared-memory column: 0 through 63
+             */
+            const int shared_row =
+                linear_index / TILE_K;
+
+            const int shared_col =
+                linear_index % TILE_K;
+
+            // Corresponding global row in B.
+            const int b_row =
+                phase * TILE_N + shared_row;
+
+            // Corresponding global column in B.
+            const int b_col =
+                block_col + shared_col;
+
+            /*
+             * Load the B value or zero-pad the boundary.
+             */
+            shared_B[shared_row][shared_col] =
+                (b_row < N && b_col < K)
+                    ? B[(size_t)b_row * K + b_col]
+                    : 0.0f;
+        }
+
+        /*
+         * Ensure the complete A and B tiles are available before
+         * any thread starts computing.
+         */
+        __syncthreads();
+
+        /*
+         * Process the 16 reduction values in this phase.
+         */
+        #pragma unroll
+        for (int i = 0; i < TILE_N; ++i)
+        {
+            /*
+             * Load two B values.
+             *
+             * These two values are reused across eight A rows.
+             */
+            const float b0 =
+                shared_B[i][local_col];
+
+            const float b1 =
+                shared_B[i][local_col + 1];
+
+            /*
+             * Load one A value at a time and consume it immediately.
+             *
+             * This shortens the live range of each A temporary.
+             */
+
+            const float a0 =
+                shared_A[local_row][i];
+
+            acc00 = fmaf(a0, b0, acc00);
+            acc01 = fmaf(a0, b1, acc01);
+
+
+            const float a1 =
+                shared_A[local_row + 1][i];
+
+            acc10 = fmaf(a1, b0, acc10);
+            acc11 = fmaf(a1, b1, acc11);
+
+
+            const float a2 =
+                shared_A[local_row + 2][i];
+
+            acc20 = fmaf(a2, b0, acc20);
+            acc21 = fmaf(a2, b1, acc21);
+
+
+            const float a3 =
+                shared_A[local_row + 3][i];
+
+            acc30 = fmaf(a3, b0, acc30);
+            acc31 = fmaf(a3, b1, acc31);
+
+
+            const float a4 =
+                shared_A[local_row + 4][i];
+
+            acc40 = fmaf(a4, b0, acc40);
+            acc41 = fmaf(a4, b1, acc41);
+
+
+            const float a5 =
+                shared_A[local_row + 5][i];
+
+            acc50 = fmaf(a5, b0, acc50);
+            acc51 = fmaf(a5, b1, acc51);
+
+
+            const float a6 =
+                shared_A[local_row + 6][i];
+
+            acc60 = fmaf(a6, b0, acc60);
+            acc61 = fmaf(a6, b1, acc61);
+
+
+            const float a7 =
+                shared_A[local_row + 7][i];
+
+            acc70 = fmaf(a7, b0, acc70);
+            acc71 = fmaf(a7, b1, acc71);
+        }
+
+        /*
+         * Ensure all threads have finished reading the current shared
+         * tiles before the next phase overwrites them.
+         */
+        __syncthreads();
+    }
+
+    /*
+     * ---------------------------------------------------------
+     * Write the 8 x 2 result tile to matrix C
+     * ---------------------------------------------------------
+     */
+
+    /*
+     * Both columns calculated by this thread are valid when:
+     *
+     *     global_col + 1 < K
+     *
+     * This is the common path for interior output tiles.
+     */
+    if (global_col + 1 < K)
+    {
+        if (global_row < M)
+        {
+            const size_t offset =
+                (size_t)global_row * K + global_col;
+
+            C[offset] = acc00;
+            C[offset + 1] = acc01;
+        }
+
+        if (global_row + 1 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 1) * K + global_col;
+
+            C[offset] = acc10;
+            C[offset + 1] = acc11;
+        }
+
+        if (global_row + 2 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 2) * K + global_col;
+
+            C[offset] = acc20;
+            C[offset + 1] = acc21;
+        }
+
+        if (global_row + 3 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 3) * K + global_col;
+
+            C[offset] = acc30;
+            C[offset + 1] = acc31;
+        }
+
+        if (global_row + 4 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 4) * K + global_col;
+
+            C[offset] = acc40;
+            C[offset + 1] = acc41;
+        }
+
+        if (global_row + 5 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 5) * K + global_col;
+
+            C[offset] = acc50;
+            C[offset + 1] = acc51;
+        }
+
+        if (global_row + 6 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 6) * K + global_col;
+
+            C[offset] = acc60;
+            C[offset + 1] = acc61;
+        }
+
+        if (global_row + 7 < M)
+        {
+            const size_t offset =
+                (size_t)(global_row + 7) * K + global_col;
+
+            C[offset] = acc70;
+            C[offset + 1] = acc71;
+        }
+    }
+    else if (global_col < K)
+    {
+        /*
+         * Boundary path when only the first of the two output columns
+         * exists.
+         */
+        if (global_row < M)
+            C[(size_t)global_row * K + global_col] = acc00;
+
+        if (global_row + 1 < M)
+            C[(size_t)(global_row + 1) * K + global_col] = acc10;
+
+        if (global_row + 2 < M)
+            C[(size_t)(global_row + 2) * K + global_col] = acc20;
+
+        if (global_row + 3 < M)
+            C[(size_t)(global_row + 3) * K + global_col] = acc30;
+
+        if (global_row + 4 < M)
+            C[(size_t)(global_row + 4) * K + global_col] = acc40;
+
+        if (global_row + 5 < M)
+            C[(size_t)(global_row + 5) * K + global_col] = acc50;
+
+        if (global_row + 6 < M)
+            C[(size_t)(global_row + 6) * K + global_col] = acc60;
+
+        if (global_row + 7 < M)
+            C[(size_t)(global_row + 7) * K + global_col] = acc70;
+    }
+}
+
+
+extern "C" void solve(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    /*
+     * 32 threads horizontally and 8 vertically.
+     *
+     * Each warp contains one complete thread row because threadIdx.x
+     * ranges from 0 through 31.
+     */
+    dim3 threadsPerBlock(
+        THREADS_X,
+        THREADS_Y
+    );
+
+    /*
+     * Each block computes a 64 x 64 output tile.
+     */
+    dim3 blocksPerGrid(
+        (K + TILE_K - 1) / TILE_K,
+        (M + TILE_M - 1) / TILE_M
+    );
+
+    matrix_multiplication_kernel_8x2
+        <<<blocksPerGrid, threadsPerBlock>>>(
+            A,
+            B,
+            C,
+            M,
+            N,
+            K
+        );
+
+    cudaDeviceSynchronize();
+}
+*/
+#include <cuda_runtime.h>
+#include <stddef.h>
+
 // Thread block dimensions:
 // 16 x 16 = 256 threads per block.
 #define THREADS_X 16
@@ -389,6 +885,7 @@ extern "C" void solve(
 
     cudaDeviceSynchronize();
 }
+*/
 /*
 // Include CUDA runtime declarations such as:
 // cudaDeviceSynchronize(), dim3, blockIdx, threadIdx, and __global__.
