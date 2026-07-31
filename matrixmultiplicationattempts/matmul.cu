@@ -40,6 +40,28 @@ const int global_row = block_row + local_row;
 
 const int global_col = block_col + local_column;
 
+float acc[MICRO_TILE][MICRO_TILE] = {};
+//Register array holding this thread's 4 x 4 output values.
+
+
+/*Divide the N dimension into phases of 16 elements.
+     *
+     * For example, when N = 35:
+     *
+     *     Phase 0 handles N indexes 0 through 15.
+     *     Phase 1 handles N indexes 16 through 31.
+     *     Phase 2 handles N indexes 32 through 34.
+     *
+     * The last phase is padded with zeros where necessary.*/
+  for (
+        int phase = 0;
+        phase < (N + TILE_N - 1) / TILE_N;
+        ++phase)
+    {
+        //Each thread loads four elements from matrix A.
+        #pragma unroll
+        for (int r = 0; r < MICRO_TILE; ++r)
+        {
 
 
 }
