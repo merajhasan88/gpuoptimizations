@@ -7,7 +7,7 @@ __device__ __forceinline__
 float fast_exp2(float x)
 {
     float y;
-
+//Special Function Unit (SFU) below on critical path
     asm volatile(
         "ex2.approx.ftz.f32 %0, %1;"
         : "=f"(y)
@@ -23,7 +23,7 @@ __device__ __forceinline__
 float fast_rcp(float x)
 {
     float y;
-
+//Special Function Unit (SFU) below on critical path
     asm volatile(
         "rcp.approx.ftz.f32 %0, %1;"
         : "=f"(y)
